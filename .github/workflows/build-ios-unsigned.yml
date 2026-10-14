@@ -19,7 +19,9 @@ jobs:
           fetch-depth: 0
 
       - name: Initialize iOS DXVK source
-        run: git submodule update --init references/fbraz3-dxvk
+        # DXVK Native keeps its DirectX, Vulkan, and SPIR-V headers in nested
+        # submodules, so a non-recursive checkout leaves d3d9.h unavailable.
+        run: git submodule update --init --recursive references/fbraz3-dxvk
 
       - name: Setup vcpkg
         uses: lukka/run-vcpkg@v11
