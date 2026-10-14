@@ -1,0 +1,128 @@
+name: Build unsigned iOS IPA
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-ios:
+    name: Generals Zero Hour iOS 16+
+    runs-on: macos-15
+    timeout-minutes: 180
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Initialize iOS DXVK source
+        run: git submodule update --init references/fbraz3-dxvk
+
+      - name: Setup vcpkg
+        uses: lukka/run-vcpkg@v11
+        with:
+          vcpkgGitCommitId: ffc071e0c08432c60c9b64f00334c0227667931b
+
+      - name: Install build tools
+        run: |
+          brew update
+          brew install cmake ninja meson pkg-config xcodegen glslang \
+            autoconf autoconf-archive automake libtool
+
+      - name: Install pinned Vulkan SDK
+        run: |
+          set -euo pipefail
+          SDK_VERSION="1.4.341.1"
+          SDK_ZIP="${RUNNER_TEMP}/vulkansdk-macos-${SDK_VERSION}.zip"
+          SDK_URL="https://sdk.lunarg.com/sdk/download/${SDK_VERSION}/mac/vulkansdk-macos-${SDK_VERSION}.zip"
+          SDK_SHA256="632cbe96c8ed6ed00c6ce25e3a7738c466134f76586e1c51f1419410d7f9042e"
+          EXTRACT_DIR="${RUNNER_TEMP}/vulkan-extract"
+          INSTALL_ROOT="${HOME}/VulkanSDK/${SDK_VERSION}"
+
+          curl -fL --retry 3 --retry-delay 10 -o "${SDK_ZIP}" "${SDK_URL}"
+          echo "${SDK_SHA256}  ${SDK_ZIP}" | shasum -a 256 -c -
+          rm -rf "${EXTRACT_DIR}"
+          mkdir -p "${EXTRACT_DIR}"
+          unzip -q "${SDK_ZIP}" -d "${EXTRACT_DIR}"
+
+          INSTALLER=$(find "${EXTRACT_DIR}" -path "*.app/Contents/MacOS/vulkansdk-macOS-*" -type f | head -1)
+          if [[ -z "${INSTALLER}" ]]; then
+            echo "Vulkan SDK installer not found"
+            exit 1
+          fi
+          chmod +x "${INSTALLER}"
+          "${INSTALLER}" \
+            --root "${INSTALL_ROOT}" \
+            --accept-licenses \
+            --default-answer \
+            --confirm-command install
+
+          VULKAN_SDK="${INSTALL_ROOT}/macOS"
+          test -f "${VULKAN_SDK}/lib/MoltenVK.xcframework/ios-arm64/libMoltenVK.a"
+          echo "VULKAN_SDK=${VULKAN_SDK}" >> "${GITHUB_ENV}"
+          echo "${VULKAN_SDK}/bin" >> "${GITHUB_PATH}"
+
+      - name: Fetch runtime frameworks and fonts
+        run: |
+          ./scripts/build/ios/fetch-moltenvk.sh
+          ./scripts/build/ios/stage-fonts.sh
+
+      - name: Configure iOS build
+        env:
+          VULKAN_SDK: ${{ env.VULKAN_SDK }}
+          VCPKG_ROOT: ${{ env.VCPKG_ROOT }}
+        run: cmake --preset ios-vulkan
+
+      - name: Build Zero Hour for iOS
+        run: cmake --build build/ios-vulkan --target z_generals -j "$(sysctl -n hw.ncpu)"
+
+      - name: Package unsigned IPA
+        env:
+          GX_BUNDLE_ID: com.alibahaa01.generalszh
+        run: ./scripts/build/ios/package-ios-zh.sh --dev --unsigned --ipa
+
+      - name: Prepare Documents support files
+        run: |
+          SUPPORT_DIR="build/ios-documents-support"
+          mkdir -p "${SUPPORT_DIR}/fonts"
+          cp "${HOME}/GeneralsX/ios-staging/fonts/"*.ttf "${SUPPORT_DIR}/fonts/"
+          cp ios/config/dxvk.conf "${SUPPORT_DIR}/dxvk.conf"
+          cp ios/config/Options.ini "${SUPPORT_DIR}/DefaultOptions.ini"
+          cat > "${SUPPORT_DIR}/COPY_GAME_FILES_HERE.txt" <<'EOF'
+          Copy the files from your legally owned Command & Conquer Generals Zero Hour
+          installation into this same folder, then transfer the complete folder contents
+          to the Generals ZH app through Apple file sharing. Do not publish game assets.
+          EOF
+          ditto -c -k --sequesterRsrc --keepParent \
+            "${SUPPORT_DIR}" "build/GeneralsXZH-Documents-support.zip"
+
+      - name: Verify IPA
+        run: |
+          IPA="build/ios-package/GeneralsXZH-unsigned.ipa"
+          test -s "${IPA}"
+          unzip -t "${IPA}"
+          unzip -l "${IPA}" | grep -q "Payload/GeneralsXZH.app/GeneralsXZH"
+
+      - name: Upload iOS package
+        uses: actions/upload-artifact@v7
+        with:
+          name: GeneralsXZH-iOS16-unsigned
+          path: |
+            build/ios-package/GeneralsXZH-unsigned.ipa
+            build/GeneralsXZH-Documents-support.zip
+          retention-days: 7
+          if-no-files-found: error
+
+      - name: Upload build logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: GeneralsXZH-iOS-build-logs
+          path: |
+            build/ios-vulkan/CMakeFiles/CMakeConfigureLog.yaml
+            ios/build/Logs/
+          retention-days: 7
+          if-no-files-found: ignore
