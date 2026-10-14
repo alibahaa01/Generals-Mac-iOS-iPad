@@ -24,9 +24,9 @@ jobs:
       - name: Setup vcpkg
         uses: lukka/run-vcpkg@v11
         with:
-          # Keep the checkout aligned with vcpkg.json's builtin baseline so
-          # version overrides such as ffmpeg 8.1.1#2 exist in the registry.
-          vcpkgGitCommitId: 533a5fda5c0646d1771345fb572e759283444d5f
+          # Pin a registry revision that contains the manifest's FFmpeg
+          # 8.1.1#2 override (the older builtin baseline predates it).
+          vcpkgGitCommitId: 44ccfd88b3eca6929d6d16398c7b19945c29a5f6
 
       - name: Install build tools
         run: |
