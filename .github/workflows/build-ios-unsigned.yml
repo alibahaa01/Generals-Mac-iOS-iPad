@@ -79,6 +79,10 @@ jobs:
         run: cmake --preset ios-vulkan
 
       - name: Build Zero Hour for iOS
+        env:
+          # DXVK is configured by Meson during this build step. Clang's CPATH
+          # ensures the iOS cross-compiler sees the SDK's Vulkan headers.
+          CPATH: ${{ env.VULKAN_SDK }}/include
         run: cmake --build build/ios-vulkan --target z_generals -j "$(sysctl -n hw.ncpu)"
 
       - name: Package unsigned IPA
