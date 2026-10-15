@@ -9,7 +9,7 @@ permissions:
 jobs:
   build-ios:
     name: Generals Zero Hour iOS 16+
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 180
 
     steps:
