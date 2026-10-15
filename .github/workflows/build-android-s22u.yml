@@ -65,6 +65,23 @@ jobs:
           meson --version
           ninja --version
 
+      - name: Stage SDL3 Android Java glue
+        run: |
+          set -euo pipefail
+          SDL_ARCHIVE="$RUNNER_TEMP/SDL3-3.4.2.tar.gz"
+          SDL_ROOT="$RUNNER_TEMP/SDL3-3.4.2"
+          curl --fail --location --retry 3 \
+            https://github.com/libsdl-org/SDL/releases/download/release-3.4.2/SDL3-3.4.2.tar.gz \
+            --output "$SDL_ARCHIVE"
+          echo "ef39a2e3f9a8a78296c40da701967dd1b0d0d6e267e483863ce70f8a03b4050c  $SDL_ARCHIVE" | sha256sum --check
+          tar -xzf "$SDL_ARCHIVE" -C "$RUNNER_TEMP"
+          SDL_JAVA="$SDL_ROOT/android-project/app/src/main/java"
+          test -f "$SDL_JAVA/org/libsdl/app/SDLActivity.java"
+          mkdir -p android/app/src/main/java
+          cp -a "$SDL_JAVA/org" android/app/src/main/java/
+          test -f android/app/src/main/java/org/libsdl/app/SDLActivity.java
+          echo "SDL3 Android Java glue staged before Gradle configuration"
+
       - name: Apply DXVK Android patch
         run: |
           cd references/fbraz3-dxvk
@@ -91,7 +108,7 @@ jobs:
           JAVA_HOME: ${{ env.JAVA_HOME }}
           GRADLE_OPTS: "-Xmx8g -XX:+UseG1GC -XX:MaxMetaspaceSize=512m"
         run: |
-          ./gradlew assembleRelease --no-daemon --stacktrace 2>&1 | tee ${GITHUB_WORKSPACE}/src/build_android.log || true
+          ./gradlew assembleRelease --no-daemon --stacktrace 2>&1 | tee ${GITHUB_WORKSPACE}/src/build_android.log
 
       - name: Build pinned mobile renderer (DXVK Native 1.9.2b + d3d8to9)
         run: |
