@@ -1,0 +1,692 @@
+From 3dab4a3b314184731ae5764e63b0fffe68db3f55 Mon Sep 17 00:00:00 2001
+From: alibahaa01 <72775133+alibahaa01@users.noreply.github.com>
+Date: Thu, 15 Oct 2026 22:26:19 +0300
+Subject: [PATCH] fix(android): harden S22 Ultra build and startup
+
+---
+ .../StdDevice/Common/StdBIGFileSystem.cpp     | 125 ++++++++++----
+ android/app/build.gradle                      |  15 +-
+ android/app/src/main/AndroidManifest.xml      |   4 +-
+ .../java/me/generalsx/zh/GameFileChecker.java | 161 +++++++++++++-----
+ .../me/generalsx/zh/LauncherActivity.java     |  44 ++++-
+ .../me/generalsx/zh/GameFileCheckerTest.java  |  92 ++++++++++
+ docs/DEV_BLOG/2026-10-DIARY.md                |  32 ++++
+ 7 files changed, 386 insertions(+), 87 deletions(-)
+ create mode 100644 android/app/src/test/java/me/generalsx/zh/GameFileCheckerTest.java
+ create mode 100644 docs/DEV_BLOG/2026-10-DIARY.md
+
+diff --git a/Core/GameEngineDevice/Source/StdDevice/Common/StdBIGFileSystem.cpp b/Core/GameEngineDevice/Source/StdDevice/Common/StdBIGFileSystem.cpp
+index f731faab4..41d74504e 100644
+--- a/Core/GameEngineDevice/Source/StdDevice/Common/StdBIGFileSystem.cpp
++++ b/Core/GameEngineDevice/Source/StdDevice/Common/StdBIGFileSystem.cpp
+@@ -40,6 +40,7 @@
+ #include "Utility/endian_compat.h"
+ 
+ #include <cstdlib>
++#include <cstdarg>
+ #include <cstdio>
+ #include <cstring>
+ 
+@@ -59,6 +60,19 @@ static const char *BIGFileIdentifier = "BIGF";
+ 
+ namespace {
+ 
++// GeneralsX @bugfix android-port 15/10/2026 Put rejected archive details in
++// the exported mobile stderr log instead of relying on debug-only assertions.
++static void reportBIGError(const char *format, ...)
++{
++	fprintf(stderr, "ERROR: BIG archive rejected: ");
++	va_list args;
++	va_start(args, format);
++	vfprintf(stderr, format, args);
++	va_end(args);
++	fputc('\n', stderr);
++	fflush(stderr);
++}
++
+ static const char* kPrimaryAssetEnvGenerals = "CNC_GENERALS_PATH";
+ static const char* kPrimaryAssetEnvZH = "CNC_GENERALS_ZH_PATH";
+ static const char* kPrimaryAssetIniKey = "AssetPath";
+@@ -529,47 +543,65 @@ ArchiveFile * StdBIGFileSystem::openArchiveFile(const Char *filename) {
+ 	AsciiString archiveFileName;
+ 	archiveFileName = filename;
+ 	archiveFileName.toLower();
+-	Int archiveFileSize = 0;
++	Int declaredArchiveSize = 0;
+ 	Int numLittleFiles = 0;
+-
+-	ArchiveFile *archiveFile = NEW StdBIGFile(filename, AsciiString::TheEmptyString);
++	Int indexEnd = 0;
+ 
+ 	DEBUG_LOG(("StdBIGFileSystem::openArchiveFile - opening BIG file %s", filename));
+ 
+ 	if (fp == nullptr) {
+-		DEBUG_CRASH(("Could not open archive file %s for parsing", filename));
++		reportBIGError("could not open %s", filename);
++		return nullptr;
++	}
++	const Int actualArchiveSize = fp->size();
++	if (actualArchiveSize < 16) {
++		reportBIGError("%s is only %d bytes", filename, actualArchiveSize);
++		fp->close();
+ 		return nullptr;
+ 	}
+ 
+ 	AsciiString asciibuf;
+-	char buffer[_MAX_PATH];
+-	fp->read(buffer, 4); // read the "BIG" at the beginning of the file.
++	char buffer[_MAX_PATH] = { 0 };
++	if (fp->read(buffer, 4) != 4) {
++		reportBIGError("could not read identifier in %s", filename);
++		fp->close();
++		return nullptr;
++	}
+ 	buffer[4] = 0;
+-	if (strcmp(buffer, BIGFileIdentifier) != 0) {
+-		DEBUG_CRASH(("Error reading BIG file identifier in file %s", filename));
++	if (strcmp(buffer, BIGFileIdentifier) != 0 && strcmp(buffer, "BIG4") != 0) {
++		reportBIGError("invalid identifier in %s", filename);
+ 		fp->close();
+-		fp = nullptr;
+ 		return nullptr;
+ 	}
+ 
+-	// read in the file size.
+-	fp->read(&archiveFileSize, 4);
+-
+-	DEBUG_LOG(("StdBIGFileSystem::openArchiveFile - size of archive file is %d bytes", archiveFileSize));
+-
+-//	char t;
+-
+-	// read in the number of files contained in this BIG file.
+-	// change the order of the bytes cause the file size is in reverse byte order for some reason.
+-	fp->read(&numLittleFiles, 4);
++	if (fp->read(&declaredArchiveSize, 4) != 4
++			|| fp->read(&numLittleFiles, 4) != 4
++			|| fp->read(&indexEnd, 4) != 4) {
++		reportBIGError("truncated header in %s", filename);
++		fp->close();
++		return nullptr;
++	}
+ 	numLittleFiles = betoh(numLittleFiles);
++	indexEnd = betoh(indexEnd);
++
++	// GeneralsX @bugfix android-port 15/10/2026 Validate the full BIG directory
++	// before trusting entry offsets or copying paths into the fixed-size buffer.
++	// Damaged mobile imports previously overran this buffer during startup and
++	// looked like a black screen followed by an unexplained launcher return.
++	if ((declaredArchiveSize > actualArchiveSize && betoh(declaredArchiveSize) > actualArchiveSize)
++			|| numLittleFiles < 0
++			|| numLittleFiles > 1000000 || indexEnd < 16
++			|| indexEnd > actualArchiveSize
++			|| numLittleFiles > (indexEnd - 16) / 9) {
++		reportBIGError("invalid header in %s (actual=%d declared=%d entries=%d indexEnd=%d)",
++			filename, actualArchiveSize, declaredArchiveSize, numLittleFiles, indexEnd);
++		fp->close();
++		return nullptr;
++	}
+ 
+-	DEBUG_LOG(("StdBIGFileSystem::openArchiveFile - %d are contained in archive", numLittleFiles));
+-//	for (Int i = 0; i < 2; ++i) {
+-//		t = buffer[i];
+-//		buffer[i] = buffer[(4-i)-1];
+-//		buffer[(4-i)-1] = t;
+-//	}
++	DEBUG_LOG(("StdBIGFileSystem::openArchiveFile - archive=%s actual=%d declared=%d entries=%d indexEnd=%d",
++		filename, actualArchiveSize, declaredArchiveSize, numLittleFiles, indexEnd));
++	ArchiveFile *archiveFile = NEW StdBIGFile(filename, AsciiString::TheEmptyString);
+ 
+ 	// seek to the beginning of the directory listing.
+ 	fp->seek(0x10, File::START);
+@@ -579,22 +611,53 @@ ArchiveFile * StdBIGFileSystem::openArchiveFile(const Char *filename) {
+ 	for (Int i = 0; i < numLittleFiles; ++i) {
+ 		Int filesize = 0;
+ 		Int fileOffset = 0;
+-		fp->read(&fileOffset, 4);
+-		fp->read(&filesize, 4);
++		if (fp->position() + 9 > indexEnd
++				|| fp->read(&fileOffset, 4) != 4
++				|| fp->read(&filesize, 4) != 4) {
++			reportBIGError("truncated directory entry %d in %s", i, filename);
++			delete fileInfo;
++			delete archiveFile;
++			fp->close();
++			return nullptr;
++		}
+ 
+ 		filesize = betoh(filesize);
+ 		fileOffset = betoh(fileOffset);
++		if (fileOffset < indexEnd || filesize < 0 || fileOffset < 0
++				|| fileOffset > actualArchiveSize
++				|| filesize > actualArchiveSize - fileOffset) {
++			reportBIGError("entry %d points outside %s (offset=%d size=%d actual=%d)",
++				i, filename, fileOffset, filesize, actualArchiveSize);
++			delete fileInfo;
++			delete archiveFile;
++			fp->close();
++			return nullptr;
++		}
+ 
+ 		fileInfo->m_archiveFilename = archiveFileName;
+ 		fileInfo->m_offset = fileOffset;
+ 		fileInfo->m_size = filesize;
+ 
+ 		// read in the path name of the file.
+-		Int pathIndex = -1;
+-		do {
++		Int pathIndex = 0;
++		Bool pathTerminated = FALSE;
++		while (pathIndex < _MAX_PATH && fp->position() < indexEnd) {
++			if (fp->read(buffer + pathIndex, 1) != 1) {
++				break;
++			}
++			if (buffer[pathIndex] == 0) {
++				pathTerminated = TRUE;
++				break;
++			}
+ 			++pathIndex;
+-			fp->read(buffer + pathIndex, 1);
+-		} while (buffer[pathIndex] != 0);
++		}
++		if (!pathTerminated || pathIndex == 0) {
++			reportBIGError("invalid or overlong path in entry %d of %s", i, filename);
++			delete fileInfo;
++			delete archiveFile;
++			fp->close();
++			return nullptr;
++		}
+ 
+ 		Int filenameIndex = pathIndex;
+ 		while ((filenameIndex >= 0) && (buffer[filenameIndex] != '\\') && (buffer[filenameIndex] != '/')) {
+diff --git a/android/app/build.gradle b/android/app/build.gradle
+index 9a5fc6565..83d89560f 100644
+--- a/android/app/build.gradle
++++ b/android/app/build.gradle
+@@ -18,14 +18,16 @@ android {
+     ndkVersion "28.2.13676358"
+ 
+     defaultConfig {
+-        applicationId "me.generalsx.zh"
++        // GeneralsX @build android-port 15/10/2026 Give Ali's clean S22 Ultra
++        // build its own package so it installs beside, rather than conflicts
++        // with, unsigned community APKs that reused me.generalsx.zh.
++        applicationId "io.github.alibahaa01.generalszh"
+         // minSdk 24 = Android 7.0: the first API level with a usable system
+         // libvulkan.so. DXVK requires native Vulkan; there is no fallback.
+         minSdk 24
+         targetSdk 35
+-        // GeneralsX @build android-port 10/09/2026 Final maintenance release.
+-        versionCode 13
+-        versionName "0.13-android"
++        versionCode 1
++        versionName "0.1-s22u"
+ 
+         // Arm64-v8a only: the game is a desktop RTS port; skip armeabi-v7a and
+         // ship x86_64 only for emulator debugging via a separate build flavor
+@@ -186,7 +188,10 @@ android {
+ //
+ // The version is read from the library itself rather than inferred from its
+ // size. Only libdxvk_d3d9.so carries the marker, so the pair is judged by it.
+-def dxvkAcceptedVersions = ["DXVK v1.9.2", "DXVK v2.6", "DXVK 2.6.0"]
++// GeneralsX @bugfix android-port 15/10/2026 DXVK Native 2.6 crashes on
++// Adreno mobile drivers used by the target SM-S908U1. Only the proven 1.9.2b
++// renderer is allowed into this APK.
++def dxvkAcceptedVersions = ["DXVK v1.9.2", "DXVK 1.9.2"]
+ 
+ tasks.register("checkStagedDxvk") {
+     description = "Verify the staged DXVK libraries are the version this port ships."
+diff --git a/android/app/src/main/AndroidManifest.xml b/android/app/src/main/AndroidManifest.xml
+index 1c1c4ad3f..c414e9f22 100644
+--- a/android/app/src/main/AndroidManifest.xml
++++ b/android/app/src/main/AndroidManifest.xml
+@@ -30,7 +30,7 @@
+ 
+     <application
+         android:allowBackup="false"
+-        android:label="Generals + Zero Hour"
++        android:label="Generals ZH Mobile"
+         android:hasCode="true"
+         android:largeHeap="true"
+         android:supportsRtl="false"
+@@ -64,7 +64,7 @@
+         <activity
+             android:name=".LauncherActivity"
+             android:exported="true"
+-            android:label="Generals + Zero Hour"
++            android:label="Generals ZH Mobile"
+             android:launchMode="singleTop"
+             android:taskAffinity=""
+             android:screenOrientation="landscape"
+diff --git a/android/app/src/main/java/me/generalsx/zh/GameFileChecker.java b/android/app/src/main/java/me/generalsx/zh/GameFileChecker.java
+index cdfbd4a58..21af7832a 100644
+--- a/android/app/src/main/java/me/generalsx/zh/GameFileChecker.java
++++ b/android/app/src/main/java/me/generalsx/zh/GameFileChecker.java
+@@ -15,14 +15,12 @@
+ //                          "BIG4" (later EA titles)
+ //     uint32  archiveSize  total size of the archive
+ //     uint32  numEntries   number of embedded files
+-//     uint32  indexSize    bytes of index before the file data
++//     uint32  dataStart    absolute end of the directory table
+ //
+-// The two length fields' endianness differs across the format's history, so we
+-// accept a match under either interpretation and only call a file broken when
+-// BOTH readings still exceed the bytes actually on disk — which is exactly the
+-// signature of a copy or download that stopped early. That is the failure this
+-// tool exists to catch; it deliberately does not try to validate archive
+-// contents, which is the engine's job.
++// The pre-flight validates the complete directory table, not just the 16-byte
++// header. The native reader uses fixed-size path buffers and trusts every entry
++// offset, so a damaged table can otherwise terminate the process while the
++// launcher only reports a black screen.
+ 
+ package me.generalsx.zh;
+ 
+@@ -55,9 +53,9 @@ final class GameFileChecker {
+     /**
+      * Validate every archive under a profile and (optionally) a mod directory.
+      *
+-     * Runs synchronously and is cheap — each archive costs one 16-byte header
+-     * read regardless of size — but callers should still invoke it off the UI
+-     * thread since a profile can hold dozens of files on slow storage.
++     * Runs synchronously and reads each compact directory table but not the
++     * archived payloads. Callers should still invoke it off the UI thread since
++     * a profile can hold dozens of files on slow storage.
+      */
+     static Result check(String engineLabel, String profileName, File profileDir,
+                         String modName, File modDir) {
+@@ -75,6 +73,7 @@ final class GameFileChecker {
+         line(sb, "");
+ 
+         checkTree(sb, "Game data", profileDir, counters);
++        checkRequiredArchive(sb, engineLabel, profileDir, counters);
+         if (modDir != null) {
+             line(sb, "");
+             checkTree(sb, "Mod: " + modName, modDir, counters);
+@@ -85,12 +84,8 @@ final class GameFileChecker {
+                 + " checked, " + counters[1] + " problem" + (counters[1] == 1 ? "" : "s")
+                 + " found.");
+         if (counters[1] == 0 && counters[0] > 0) {
+-            line(sb, "All archives look intact. If the game still fails to start, the");
+-            // GeneralsX @bugfix android-port 11/09/2026 State the limits of the
+-            // inexpensive header/size check; it cannot prove content completeness.
+-            line(sb, "No header/size problems found. Contents and required-file");
+-            line(sb, "completeness were not checked — check logcat (tag '" + TAG + "'");
+-            line(sb, "and the engine's own output) for the failing stage.");
++            line(sb, "Headers, directory tables, entry ranges and required startup");
++            line(sb, "archives passed. If the game still fails, export the engine log.");
+         } else if (counters[1] > 0) {
+             line(sb, "Re-import or re-download the file(s) marked [FAIL] above; a partial");
+             line(sb, "copy is the usual cause. Export this report to share the details.");
+@@ -123,8 +118,43 @@ final class GameFileChecker {
+         }
+     }
+ 
+-    /** Archives directly in {@code dir} and one level down (engine layout). */
++    // GeneralsX @bugfix android-port 15/10/2026 Refuse to launch a profile that
++    // contains arbitrary BIG files but not the selected engine's startup INI.
++    private static void checkRequiredArchive(StringBuilder sb, String engineLabel,
++                                             File profileDir, int[] counters) {
++        String required = "Zero Hour".equals(engineLabel) ? "INIZH.big" : "INI.big";
++        if (!containsArchiveNamed(profileDir, required)) {
++            counters[1]++;
++            line(sb, "  [FAIL] Missing required " + required
++                    + " for " + engineLabel + ". Select the full game folder.");
++        }
++    }
++
++    private static boolean containsArchiveNamed(File dir, String wanted) {
++        return containsArchiveNamed(dir, wanted, 0);
++    }
++
++    private static boolean containsArchiveNamed(File dir, String wanted, int depth) {
++        if (depth > 12) return false;
++        if (dir == null || !dir.isDirectory()) return false;
++        File[] top = dir.listFiles();
++        if (top == null) return false;
++        for (File f : top) {
++            if (f.isFile() && wanted.equalsIgnoreCase(f.getName())) return true;
++        }
++        for (File f : top) {
++            if (f.isDirectory() && containsArchiveNamed(f, wanted, depth + 1)) return true;
++        }
++        return false;
++    }
++
++    /** Archives below {@code dir}, matching the engine's recursive scan. */
+     private static void collectArchives(File dir, List<File> out) {
++        collectArchives(dir, out, 0);
++    }
++
++    private static void collectArchives(File dir, List<File> out, int depth) {
++        if (depth > 12) return;
+         File[] top = dir.listFiles();
+         if (top == null) return;
+         Arrays.sort(top);
+@@ -132,21 +162,15 @@ final class GameFileChecker {
+             if (f.isFile() && LauncherConfig.isArchive(f.getName())) out.add(f);
+         }
+         for (File f : top) {
+-            if (f.isDirectory()) {
+-                File[] sub = f.listFiles();
+-                if (sub == null) continue;
+-                Arrays.sort(sub);
+-                for (File s : sub) {
+-                    if (s.isFile() && LauncherConfig.isArchive(s.getName())) out.add(s);
+-                }
+-            }
++            if (f.isDirectory()) collectArchives(f, out, depth + 1);
+         }
+     }
+ 
+     /**
+      * @return null when the archive is intact, otherwise a short reason string.
+      */
+-    private static String inspect(File f) {
++    // Package-private for deterministic local unit tests.
++    static String inspect(File f) {
+         long len = f.length();
+         if (!f.canRead()) return "unreadable (permission or I/O error)";
+         if (len == 0)     return "empty file (0 bytes)";
+@@ -155,29 +179,74 @@ final class GameFileChecker {
+         byte[] head = new byte[16];
+         try (RandomAccessFile raf = new RandomAccessFile(f, "r")) {
+             raf.readFully(head);
+-        } catch (IOException e) {
+-            return "could not read header (" + e.getMessage() + ")";
+-        }
++            String magic = new String(head, 0, 4,
++                    java.nio.charset.StandardCharsets.US_ASCII);
++            if (!"BIGF".equals(magic) && !"BIG4".equals(magic)) {
++                return "bad magic '" + printable(magic) + "' — not a BIG archive "
++                        + "(wrong file, or an HTML error page saved as .big)";
++            }
+ 
+-        String magic = new String(head, 0, 4, java.nio.charset.StandardCharsets.US_ASCII);
+-        if (!"BIGF".equals(magic) && !"BIG4".equals(magic)) {
+-            return "bad magic '" + printable(magic) + "' — not a BIG archive "
+-                    + "(wrong file, or an HTML error page saved as .big)";
+-        }
++            long declaredLE = u32le(head, 4);
++            long declaredBE = u32be(head, 4);
++            boolean matches = declaredLE == len || declaredBE == len;
++            if (!matches && len < declaredLE && len < declaredBE) {
++                long expected = Math.min(declaredLE, declaredBE);
++                return "truncated — header declares " + expected + " bytes but only "
++                        + len + " are on disk (" + GameDataImporter.human(len) + " of "
++                        + GameDataImporter.human(expected) + ")";
++            }
++
++            long entries = u32be(head, 8);
++            long dataStart = u32be(head, 12);
++            if (entries > 1_000_000L) {
++                return "unreasonable directory entry count (" + entries + ")";
++            }
++            if (dataStart < 16 || dataStart > len) {
++                return "directory table ends outside the archive (" + dataStart + ")";
++            }
++            if (16L + entries * 9L > dataStart) {
++                return "directory table is too short for " + entries + " entries";
++            }
+ 
+-        long declaredLE = u32le(head, 4);
+-        long declaredBE = u32be(head, 4);
+-        boolean matches = declaredLE == len || declaredBE == len;
+-        if (!matches && len < declaredLE && len < declaredBE) {
+-            long expected = Math.min(declaredLE, declaredBE);
+-            return "truncated — header declares " + expected + " bytes but only "
+-                    + len + " are on disk (" + GameDataImporter.human(len) + " of "
+-                    + GameDataImporter.human(expected) + ")";
++            byte[] entry = new byte[8];
++            raf.seek(16);
++            for (long i = 0; i < entries; i++) {
++                if (raf.getFilePointer() + 9 > dataStart) {
++                    return "directory entry " + i + " is truncated";
++                }
++                raf.readFully(entry);
++                long offset = u32be(entry, 0);
++                long size = u32be(entry, 4);
++                if (offset > Integer.MAX_VALUE || size > Integer.MAX_VALUE) {
++                    return "entry " + i + " exceeds the engine's 32-bit file limits";
++                }
++                if (offset < dataStart || offset + size > len) {
++                    return "entry " + i + " points outside the archive (offset "
++                            + offset + ", size " + size + ")";
++                }
++
++                int nameBytes = 0;
++                boolean terminated = false;
++                while (raf.getFilePointer() < dataStart) {
++                    int b = raf.read();
++                    if (b < 0) break;
++                    if (b == 0) {
++                        terminated = true;
++                        break;
++                    }
++                    nameBytes++;
++                    if (nameBytes >= 260) {
++                        return "entry " + i + " has a path longer than the engine limit";
++                    }
++                }
++                if (!terminated || nameBytes == 0) {
++                    return "entry " + i + " has an invalid or unterminated path";
++                }
++            }
++            return null;
++        } catch (IOException e) {
++            return "could not read archive (" + e.getMessage() + ")";
+         }
+-        // Magic is valid and the file is not short of its declared length. A size
+-        // field that still disagrees is unusual but not a load-blocker on its own,
+-        // so it is not counted as a failure.
+-        return null;
+     }
+ 
+     // --- header helpers -----------------------------------------------------
+diff --git a/android/app/src/main/java/me/generalsx/zh/LauncherActivity.java b/android/app/src/main/java/me/generalsx/zh/LauncherActivity.java
+index 29968246e..71a77c62e 100644
+--- a/android/app/src/main/java/me/generalsx/zh/LauncherActivity.java
++++ b/android/app/src/main/java/me/generalsx/zh/LauncherActivity.java
+@@ -471,6 +471,43 @@ public class LauncherActivity extends Activity {
+             toast("No game data installed yet.");
+             return;
+         }
++
++        // GeneralsX @bugfix android-port 15/10/2026 Always validate the selected
++        // archives before native startup. A malformed BIG directory used to
++        // terminate the engine during archive initialization and appear to the
++        // player as a black screen followed by an unexplained return here.
++        final String engineLabel = LauncherConfig.engineLabel(LauncherConfig.engine(this));
++        final String profileName = LauncherConfig.getSelectedProfile(this);
++        final File profileDir = LauncherConfig.profileDir(this, profileName);
++        final String modName = prefs().getString(LauncherConfig.KEY_MOD, "");
++        final File modsRoot = LauncherConfig.modsRoot(this);
++        final File modDir = (modName == null || modName.isEmpty() || modsRoot == null)
++                ? null : new File(modsRoot, modName);
++
++        setBusy(true);
++        statusText.setText("Checking game files before launch…");
++        new Thread(new Runnable() {
++            @Override public void run() {
++                final GameFileChecker.Result r = GameFileChecker.check(
++                        engineLabel, profileName, profileDir, modName, modDir);
++                runOnUiThread(new Runnable() {
++                    @Override public void run() {
++                        lastReport = r.report;
++                        if (!isUiAlive()) return;
++                        setBusy(false);
++                        updateSummary();
++                        if (r.problems > 0 || r.archivesChecked == 0) {
++                            showCheckResult(r);
++                            return;
++                        }
++                        startVerifiedGame();
++                    }
++                });
++            }
++        }, "game-file-preflight").start();
++    }
++
++    private void startVerifiedGame() {
+         ArrayList<String> args = LauncherConfig.buildArguments(this);
+         Intent i = new Intent(this, GameActivity.class);
+         i.putStringArrayListExtra(GameActivity.EXTRA_ARGS, args);
+@@ -790,8 +827,9 @@ public class LauncherActivity extends Activity {
+ 
+     /**
+      * Validate the selected profile's archives (and the active mod's) before the
+-     * engine ever sees them. The header read is cheap, but a profile can hold
+-     * dozens of files, so it runs off the UI thread.
++     * engine ever sees them. The complete directory-table read is small compared
++     * with archive payloads, but a profile can hold dozens of files, so it runs
++     * off the UI thread.
+      */
+     private void verifyGameFiles() {
+         if (profiles.isEmpty()) { toast("No game data installed yet."); return; }
+@@ -825,7 +863,7 @@ public class LauncherActivity extends Activity {
+                     }
+                 });
+             }
+-        }).start();
++        }, "manual-game-file-check").start();
+     }
+ 
+     private void showCheckResult(GameFileChecker.Result r) {
+diff --git a/android/app/src/test/java/me/generalsx/zh/GameFileCheckerTest.java b/android/app/src/test/java/me/generalsx/zh/GameFileCheckerTest.java
+new file mode 100644
+index 000000000..35c413244
+--- /dev/null
++++ b/android/app/src/test/java/me/generalsx/zh/GameFileCheckerTest.java
+@@ -0,0 +1,92 @@
++package me.generalsx.zh;
++
++import static org.junit.Assert.assertNull;
++import static org.junit.Assert.assertTrue;
++
++import java.io.ByteArrayOutputStream;
++import java.io.File;
++import java.nio.charset.StandardCharsets;
++import java.nio.file.Files;
++import org.junit.Test;
++
++// GeneralsX @test android-port 15/10/2026 Lock the mobile BIG pre-flight to
++// reject corrupt directory tables before the native engine parses them.
++public class GameFileCheckerTest {
++    @Test public void validSingleEntryArchivePasses() throws Exception {
++        assertNull(GameFileChecker.inspect(writeArchive(archive("Data/INI/test.ini", 3, false))));
++    }
++
++    @Test public void directoryTooShortForEntryIsRejected() throws Exception {
++        byte[] bytes = archive("a", 1, false);
++        putBe32(bytes, 12, 24);
++        assertContains(GameFileChecker.inspect(writeArchive(bytes)), "directory table is too short");
++    }
++
++    @Test public void entryOutsideArchiveIsRejected() throws Exception {
++        byte[] bytes = archive("a", 1, false);
++        putBe32(bytes, 16, bytes.length + 10);
++        assertContains(GameFileChecker.inspect(writeArchive(bytes)), "points outside the archive");
++    }
++
++    @Test public void unterminatedPathIsRejected() throws Exception {
++        assertContains(GameFileChecker.inspect(writeArchive(archive("abc", 1, true))),
++                "invalid or unterminated path");
++    }
++
++    @Test public void pathLongerThanEngineBufferIsRejected() throws Exception {
++        StringBuilder name = new StringBuilder();
++        for (int i = 0; i < 260; i++) name.append('a');
++        assertContains(GameFileChecker.inspect(writeArchive(archive(name.toString(), 1, true))),
++                "path longer than the engine limit");
++    }
++
++    private static byte[] archive(String name, int payloadSize, boolean omitTerminator)
++            throws Exception {
++        byte[] path = name.getBytes(StandardCharsets.US_ASCII);
++        int dataStart = 16 + 8 + path.length + (omitTerminator ? 0 : 1);
++        int totalSize = dataStart + payloadSize;
++        ByteArrayOutputStream out = new ByteArrayOutputStream(totalSize);
++        out.write(new byte[] {'B', 'I', 'G', 'F'});
++        writeLe32(out, totalSize);
++        writeBe32(out, 1);
++        writeBe32(out, dataStart);
++        writeBe32(out, dataStart);
++        writeBe32(out, payloadSize);
++        out.write(path);
++        if (!omitTerminator) out.write(0);
++        for (int i = 0; i < payloadSize; i++) out.write(i);
++        return out.toByteArray();
++    }
++
++    private static File writeArchive(byte[] bytes) throws Exception {
++        File file = Files.createTempFile("generals-big-", ".big").toFile();
++        Files.write(file.toPath(), bytes);
++        return file;
++    }
++
++    private static void assertContains(String actual, String expected) {
++        assertTrue("Expected '" + expected + "' in: " + actual,
++                actual != null && actual.contains(expected));
++    }
++
++    private static void writeLe32(ByteArrayOutputStream out, int value) {
++        out.write(value & 0xff);
++        out.write((value >>> 8) & 0xff);
++        out.write((value >>> 16) & 0xff);
++        out.write((value >>> 24) & 0xff);
++    }
++
++    private static void writeBe32(ByteArrayOutputStream out, int value) {
++        out.write((value >>> 24) & 0xff);
++        out.write((value >>> 16) & 0xff);
++        out.write((value >>> 8) & 0xff);
++        out.write(value & 0xff);
++    }
++
++    private static void putBe32(byte[] bytes, int offset, int value) {
++        bytes[offset] = (byte) (value >>> 24);
++        bytes[offset + 1] = (byte) (value >>> 16);
++        bytes[offset + 2] = (byte) (value >>> 8);
++        bytes[offset + 3] = (byte) value;
++    }
++}
+diff --git a/docs/DEV_BLOG/2026-10-DIARY.md b/docs/DEV_BLOG/2026-10-DIARY.md
+new file mode 100644
+index 000000000..918e95db6
+--- /dev/null
++++ b/docs/DEV_BLOG/2026-10-DIARY.md
+@@ -0,0 +1,32 @@
++# October 2026 development diary
++
++## 2026-10-15 — Clean SM-S908U1 Android build lane
++
++Created a standalone `android-s22u` product branch for Ali's US-unlocked Samsung
++Galaxy S22 Ultra (`SM-S908U1`, Snapdragon/Adreno). It uses the distinct
++`io.github.alibahaa01.generalszh` application ID, so community APKs that used
++`me.generalsx.zh` cannot cause a signature conflict with this build.
++
++The Android workflow had drifted back to the experimental DXVK 2.6 source even
++though the maintenance handover states that shipped mobile builds use DXVK
++Native 1.9.2b plus d3d8to9. The workflow now fetches exact reviewed commits,
++applies the repository's Android/arm64 patches, builds only D3D9, builds the
++64-bit-safe d3d8to9 frontend separately, and rejects artifacts that do not
++identify as DXVK 1.9.2 or AArch64. The installable artifact is a debug-signed
++arm64 APK; a release APK is also assembled but remains unsigned.
++
++The reported device log stopped while `StdBIGFileSystem` was initializing. The
++launcher file check previously read only a BIG archive's 16-byte header, while
++the native parser trusted entry counts, offsets, sizes, and unbounded path
++strings. Both layers now validate the complete directory table. Play performs
++the check automatically, verifies the engine-specific startup archive
++(`INIZH.big` or `INI.big`), and blocks native startup with a readable report if
++the imported data is incomplete. The native reader independently bounds every
++read and records the rejected archive in exported stderr rather than overrunning
++its path buffer. JVM tests cover valid, truncated, out-of-range, unterminated,
++and overlong BIG directory entries.
++
++Build and real-device validation are still required. The acceptance run is:
++install beside the old package, import the complete Steam Zero Hour directory,
++launch on the SM-S908U1, enter a skirmish, and export the engine log if startup
++does not reach the menu.
+-- 
+2.53.0.windows.3
+
