@@ -74,7 +74,7 @@ diff --git a/src/d3d9/d3d9_device.cpp b/src/d3d9/d3d9_device.cpp
 diff --git a/src/d3d9/d3d9_util.h b/src/d3d9/d3d9_util.h
 --- a/src/d3d9/d3d9_util.h
 +++ b/src/d3d9/d3d9_util.h
-@@ -218,10 +218,14 @@ namespace dxvk {
+@@ -218,10 +218,13 @@ namespace dxvk {
  
    inline VkSamplerAddressMode DecodeAddressMode(D3DTEXTUREADDRESS Mode) {
      constexpr uint32_t Lut =
