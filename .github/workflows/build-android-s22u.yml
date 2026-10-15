@@ -1,0 +1,274 @@
+name: Build Android APK
+
+permissions:
+  contents: read
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/build-android-s22u.yml'
+      - 'Patches/android-s22u-source.patch'
+
+jobs:
+  build-android:
+    name: Android APK (arm64-v8a)
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    defaults:
+      run:
+        working-directory: src
+
+    steps:
+      - name: Checkout control files
+        uses: actions/checkout@v4
+        with:
+          path: control
+          fetch-depth: 1
+
+      - name: Prepare pinned Android source
+        working-directory: .
+        run: |
+          git clone --filter=blob:none https://github.com/l3ad3r1/GeneralsZH-Android.git src
+          git -C src checkout --detach 536401d40ed7a5a371e7c2d848e6e922416d92fa
+          git -C src submodule update --init --recursive
+          git -C src apply --check "$GITHUB_WORKSPACE/control/Patches/android-s22u-source.patch"
+          git -C src apply "$GITHUB_WORKSPACE/control/Patches/android-s22u-source.patch"
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
+        with:
+          accept-android-sdk-licenses: true
+          packages: 'platform-tools'
+
+      - name: Install Android NDK
+        run: |
+          sdkmanager "ndk;28.2.13676358"
+          echo "ANDROID_NDK_HOME=${ANDROID_HOME}/ndk/28.2.13676358" >> $GITHUB_ENV
+          echo "NDK installed: $(ls ${ANDROID_HOME}/ndk/28.2.13676358/)"
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends \
+            cmake ninja-build meson python3-pip pkg-config zip glslang-tools
+          pip3 install meson
+          echo "Build tools:"
+          cmake --version
+          meson --version
+          ninja --version
+
+      - name: Apply DXVK Android patch
+        run: |
+          cd references/fbraz3-dxvk
+          git apply --check "${GITHUB_WORKSPACE}/src/Patches/dxvk-android.patch"
+          git apply "${GITHUB_WORKSPACE}/src/Patches/dxvk-android.patch"
+          echo "DXVK Android patch applied"
+
+      - name: Cache DXVK build
+        uses: actions/cache@v4
+        with:
+          path: src/android/app/.cxx
+          key: dxvk-cxx-${{ runner.os }}-${{ hashFiles('src/references/fbraz3-dxvk/**', 'src/CMakeLists.txt', 'src/cmake/**') }}
+          restore-keys: dxvk-cxx-${{ runner.os }}-
+
+      - name: Generate Gradle wrapper
+        working-directory: src/android
+        run: |
+          gradle wrapper --gradle-version 8.7
+          chmod +x gradlew
+
+      - name: Build APK (assembleRelease) — pass 1
+        working-directory: src/android
+        env:
+          JAVA_HOME: ${{ env.JAVA_HOME }}
+          GRADLE_OPTS: "-Xmx8g -XX:+UseG1GC -XX:MaxMetaspaceSize=512m"
+        run: |
+          ./gradlew assembleRelease --no-daemon --stacktrace 2>&1 | tee ${GITHUB_WORKSPACE}/src/build_android.log || true
+
+      - name: Build pinned mobile renderer (DXVK Native 1.9.2b + d3d8to9)
+        run: |
+          set -euo pipefail
+          echo "==> Locating CXX build directory"
+          CXX_BASE=$(find android/app/.cxx -maxdepth 2 -type d -name "RelWithDebInfo" 2>/dev/null | head -1)
+          HASH_DIR=$(find "$CXX_BASE" -maxdepth 1 -type d ! -name "RelWithDebInfo" | head -1)
+          CXX_DIR="$HASH_DIR/arm64-v8a"
+          echo "CXX_DIR=$CXX_DIR"
+
+          # GeneralsX @build android-port 15/10/2026 Build the renderer pair
+          # that completed real-device mobile gameplay. DXVK 2.6 is deliberately
+          # not shipped: its Android/Adreno path is not compatible with this app.
+          RENDERER_ROOT="$RUNNER_TEMP/generals-renderer"
+          DXVK_SRC="$RENDERER_ROOT/dxvk-native"
+          D3D8_SRC="$RENDERER_ROOT/d3d8to9"
+          DXVK_BUILD="$RENDERER_ROOT/dxvk-build"
+          D3D8_BUILD="$RENDERER_ROOT/d3d8-build"
+          CROSS_FILE="$CXX_DIR/meson-android-aarch64-cross.ini"
+          SDL3_PC="$CXX_DIR/sdl3-pkgconfig"
+
+          rm -rf "$RENDERER_ROOT"
+          mkdir -p "$RENDERER_ROOT" "$D3D8_BUILD"
+          git clone --filter=blob:none https://github.com/Joshua-Ashton/dxvk-native.git "$DXVK_SRC"
+          git -C "$DXVK_SRC" checkout --detach c8dc91fabd00cac11d697ccf07426e798393cd40
+          git clone --filter=blob:none https://github.com/crosire/d3d8to9.git "$D3D8_SRC"
+          git -C "$D3D8_SRC" checkout --detach 6cdb8a82184898f1b9371e4c8412c2d33ebb7b51
+          git -C "$DXVK_SRC" apply --check "$GITHUB_WORKSPACE/src/Patches/dxvk-native-1.9.2b-android-sdl3.patch"
+          git -C "$DXVK_SRC" apply "$GITHUB_WORKSPACE/src/Patches/dxvk-native-1.9.2b-android-sdl3.patch"
+          git -C "$D3D8_SRC" apply --check "$GITHUB_WORKSPACE/src/Patches/d3d8to9-android-arm64.patch"
+          git -C "$D3D8_SRC" apply "$GITHUB_WORKSPACE/src/Patches/d3d8to9-android-arm64.patch"
+
+          echo "==> Step 1: Build SDL3 (DXVK meson needs it for pkg-config)"
+          ninja -C "$CXX_DIR" SDL3-shared
+
+          # Gradle remaps CMake output paths to build/intermediates/cxx/.
+          # The pkg-config shim (written by dx8.cmake at CMake configure time)
+          # expects libSDL3.so at $CXX_DIR/_deps/sdl3-build/. Copy it there.
+          SDL3_GRADLE=$(find android/app/build/intermediates/cxx -name "libSDL3.so" -type f 2>/dev/null | head -1)
+          if [ -n "$SDL3_GRADLE" ]; then
+            mkdir -p "$CXX_DIR/_deps/sdl3-build"
+            cp -f "$SDL3_GRADLE" "$CXX_DIR/_deps/sdl3-build/libSDL3.so"
+            echo "  Copied SDL3 from Gradle intermediates to $CXX_DIR/_deps/sdl3-build/"
+          fi
+          ls -lh "$CXX_DIR/_deps/sdl3-build/libSDL3.so" 2>&1 || { echo "FAIL: libSDL3.so not found"; exit 1; }
+
+          # DXVK meson.build uses dependency('SDL3') (uppercase). pkg-config
+          # is case-sensitive and looks for SDL3.pc. Our shim is sdl3.pc.
+          # Create uppercase aliases.
+          if [ ! -f "$SDL3_PC/SDL3.pc" ]; then
+            cp "$SDL3_PC/sdl3.pc" "$SDL3_PC/SDL3.pc"
+            sed -i 's/^Name: sdl3$/Name: SDL3/' "$SDL3_PC/SDL3.pc"
+            echo "  Created SDL3.pc alias"
+          fi
+
+          echo "==> Step 2: Verify pkg-config finds SDL3 (uppercase)"
+          PKG_CONFIG_PATH="${SDL3_PC}:${PKG_CONFIG_PATH:-}" pkg-config --modversion SDL3 2>&1 || echo "WARNING: pkg-config cannot find SDL3"
+
+          # The pinned native patch uses find_library('SDL3'). Give the NDK
+          # compiler/linker the exact pass-1 SDL3 include and library paths.
+          sed -i "/^cpp_args/s|]$|, '-I$CXX_DIR/_deps/sdl3-src/include']|" "$CROSS_FILE"
+          sed -i "/^cpp_link_args/s|]$|, '-L$CXX_DIR/_deps/sdl3-build']|" "$CROSS_FILE"
+          grep -E '^cpp_(args|link_args)' "$CROSS_FILE"
+
+          echo "==> Step 3: Configure pinned DXVK Native"
+          export PKG_CONFIG_PATH="${SDL3_PC}:${PKG_CONFIG_PATH:-}"
+          meson setup "$DXVK_BUILD" "$DXVK_SRC" \
+            --cross-file "$CROSS_FILE" \
+            -Ddxvk_native_force=true \
+            -Ddxvk_native_wsi=sdl3 \
+            -Denable_d3d9=true \
+            -Denable_dxgi=false \
+            -Denable_d3d10=false \
+            -Denable_d3d11=false \
+            -Denable_tests=false \
+            --buildtype=release
+
+          echo "==> Step 4: Build D3D9 renderer"
+          meson compile -C "$DXVK_BUILD" dxvk_d3d9
+
+          D3D9_LIB=$(find "$DXVK_BUILD" -name libdxvk_d3d9.so -type f | head -1)
+          test -n "$D3D9_LIB"
+
+          echo "==> Step 5: Build 64-bit-safe D3D8 frontend"
+          NDK_BIN="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          mapfile -t D3D8_SOURCES < <(find "$D3D8_SRC/source" -maxdepth 1 -name '*.cpp' -type f | sort)
+          "$NDK_BIN/aarch64-linux-android24-clang++" \
+            -shared -fPIC -std=c++17 -O2 -DANDROID -D__ANDROID__ -DD3D8TO9NOLOG \
+            -Wno-delete-non-virtual-dtor -Wno-unknown-pragmas \
+            -I"$D3D8_SRC/source" \
+            -I"$DXVK_SRC/include/native" \
+            -I"$DXVK_SRC/include/native/windows" \
+            -I"$DXVK_SRC/include/native/directx" \
+            "${D3D8_SOURCES[@]}" "$D3D9_LIB" \
+            -Wl,--no-undefined -Wl,-soname,libdxvk_d3d8.so -llog -ldl \
+            -o "$D3D8_BUILD/libdxvk_d3d8.so"
+
+          echo "==> Step 6: Verify pinned arm64 renderer"
+          D3D8_LIB="$D3D8_BUILD/libdxvk_d3d8.so"
+          test -f "$D3D8_LIB"
+          strings "$D3D9_LIB" | grep -Eq 'DXVK v?1\.9\.2'
+          test "$(stat -c%s "$D3D9_LIB")" -lt 5242880
+          "$NDK_BIN/llvm-readelf" -h "$D3D9_LIB" | grep -q 'AArch64'
+          "$NDK_BIN/llvm-readelf" -h "$D3D8_LIB" | grep -q 'AArch64'
+          "$NDK_BIN/llvm-readelf" -d "$D3D8_LIB" | grep -q 'libdxvk_d3d9.so'
+          echo "  OK: $D3D8_LIB ($(stat -c%s "$D3D8_LIB") bytes)"
+          echo "  OK: $D3D9_LIB ($(stat -c%s "$D3D9_LIB") bytes)"
+
+          echo "D3D8_LIB=$D3D8_LIB" >> "$GITHUB_ENV"
+          echo "D3D9_LIB=$D3D9_LIB" >> "$GITHUB_ENV"
+
+      - name: Stage ALL .so to jniLibs and rebuild APK
+        working-directory: src/android
+        env:
+          JAVA_HOME: ${{ env.JAVA_HOME }}
+          GRADLE_OPTS: "-Xmx8g -XX:+UseG1GC -XX:MaxMetaspaceSize=512m"
+        run: |
+          set -euo pipefail
+          JNI_LIBS="app/src/main/jniLibs/arm64-v8a"
+          mkdir -p "$JNI_LIBS"
+
+          CXX_BASE=$(find app/.cxx -maxdepth 2 -type d -name "RelWithDebInfo" 2>/dev/null | head -1)
+          HASH_DIR=$(find "$CXX_BASE" -maxdepth 1 -type d ! -name "RelWithDebInfo" | head -1)
+          CXX_DIR="$HASH_DIR/arm64-v8a"
+
+          # Copy game .so files from CMake build tree and Gradle intermediates
+          GRADLE_CXX=$(find app/build/intermediates/cxx -maxdepth 3 -type d -name "obj" 2>/dev/null | head -1)
+          for lib in libmain.so libmain_generals.so libSDL3.so libSDL3_image.so libopenal.so libfreetype.so libglm.so libgamespy.so libc++_shared.so; do
+            found=$(find "$CXX_DIR" -maxdepth 5 -name "$lib" -type f 2>/dev/null | head -1)
+            if [ -z "$found" ] && [ -n "$GRADLE_CXX" ]; then
+              found=$(find "$GRADLE_CXX" -maxdepth 5 -name "$lib" -type f 2>/dev/null | head -1)
+            fi
+            if [ -n "$found" ]; then
+              cp -f "$found" "$JNI_LIBS/$lib"
+              echo "  staged $lib ($(stat -c%s "$JNI_LIBS/$lib") bytes)"
+            fi
+          done
+
+          cp -f "$D3D8_LIB" "$JNI_LIBS/libdxvk_d3d8.so"
+          cp -f "$D3D9_LIB" "$JNI_LIBS/libdxvk_d3d9.so"
+          echo "  staged pinned libdxvk_d3d8.so"
+          echo "  staged pinned libdxvk_d3d9.so"
+
+          echo "=== jniLibs ==="
+          ls -lh "$JNI_LIBS/"
+
+          # Pass 2: package an immediately installable debug-signed APK and an
+          # unsigned release APK for later production signing.
+          ./gradlew testDebugUnitTest assembleDebug assembleRelease \
+            -PSAGE_SKIP_NATIVE_BUILD=true --no-daemon --stacktrace \
+            2>&1 | tee -a ${GITHUB_WORKSPACE}/src/build_android.log
+
+      - name: Find APK
+        id: find-apk
+        run: |
+          APK=$(find android/app/build/outputs -name "app-debug.apk" -type f 2>/dev/null | head -1)
+          if [ -z "$APK" ]; then
+            echo "APK not found"
+            find android/app/build/outputs -type f 2>/dev/null || echo "No outputs"
+            tail -100 build_android.log 2>/dev/null || true
+            exit 1
+          fi
+          echo "APK found: $APK"
+          echo "apk_path=$APK" >> $GITHUB_OUTPUT
+          ls -lh "$APK"
+
+      - name: Upload APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: GeneralsZH-S22Ultra-installable
+          path: src/${{ steps.find-apk.outputs.apk_path }}
+          retention-days: 30
+
+      - name: Upload Build Log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log-android
+          path: src/build_android.log
+          retention-days: 7
